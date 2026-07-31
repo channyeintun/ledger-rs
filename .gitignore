@@ -1,0 +1,7 @@
+/target
+*.pdb
+
+# Local environment / connection strings — never commit a DATABASE_URL.
+.env
+.env.*
+!.env.example
