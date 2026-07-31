@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f4b5e6691f5985951a3d492b745b5266639a8b31cca3b1ba5665dda6f541a9f5 # shrinks to openings = [0, 0, 0, 0], ops = [Op { from: 0, to: 2, minor_units: 16320 }, Op { from: 2, to: 2, minor_units: 2638 }, Op { from: 0, to: 1, minor_units: 1347 }, Op { from: 3, to: 3, minor_units: 10108 }, Op { from: 1, to: 3, minor_units: 10661 }, Op { from: 3, to: 0, minor_units: 10748 }, Op { from: 2, to: 2, minor_units: 9575 }, Op { from: 0, to: 1, minor_units: 18835 }, Op { from: 0, to: 3, minor_units: 10881 }, Op { from: 0, to: 2, minor_units: 15153 }, Op { from: 1, to: 0, minor_units: 17881 }, Op { from: 2, to: 2, minor_units: 14857 }, Op { from: 1, to: 3, minor_units: 13350 }, Op { from: 3, to: 3, minor_units: 1386 }]

@@ -62,6 +62,28 @@
 //! `23505`. The loser never reaches the entry inserts, so duplicate entries are
 //! not merely unlikely, they are unreachable. A separate read-then-insert
 //! "check if the key exists first" barrier would be exactly the race this avoids.
+//!
+//! ## A rejected transfer releases its key
+//!
+//! The key is claimed inside the same database transaction that moves the
+//! money, so a rejection — insufficient funds, unknown account, a transient
+//! failure — rolls the claim back with everything else. The key is then free,
+//! and the client may retry it.
+//!
+//! This is a deliberate choice with a real trade-off, not an accident:
+//!
+//! * *For:* a transient failure must never permanently poison a key. If the
+//!   claim survived the rollback, a database blip would leave the caller unable
+//!   to complete a payment it is entitled to make, with no way to distinguish
+//!   "already done" from "never happened".
+//! * *Against:* it means the same key can produce different outcomes at
+//!   different times. A caller that is rejected for insufficient funds, and
+//!   retries the same key after the account is topped up, moves money — where
+//!   a system that persisted the failure would keep returning the original
+//!   error. (Stripe, for instance, persists API-level errors against the key.)
+//!
+//! Callers that need "this exact attempt failed, permanently" should mint a new
+//! key per attempt rather than reusing one across a funding event.
 
 use std::collections::HashMap;
 

@@ -10,7 +10,9 @@
 -- Sign convention: balance = SUM(debits) - SUM(credits) ("debit-positive").
 -- A transfer of X from A to B credits A (-X) and debits B (+X).
 
--- Postgres 13+ for pg_current_xact_id(); we target 14+.
+-- REQUIRES POSTGRES 13 OR LATER: `xid8` and `pg_current_xact_id()` below do
+-- not exist before 13, and the resulting migration error ("type xid8 does not
+-- exist") does not point at the version. CI and the test harness pin 17.
 
 CREATE TYPE entry_direction AS ENUM ('debit', 'credit');
 

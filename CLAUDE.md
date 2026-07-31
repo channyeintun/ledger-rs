@@ -85,6 +85,29 @@ sweep.
   is the serialization point for concurrent replays; a read-then-insert check
   is the race it exists to prevent.
 
+## A rejected transfer releases its idempotency key
+
+The key is claimed inside the same database transaction that moves the money, so
+a rejection rolls the claim back with everything else and the key becomes
+reusable. Deliberate, with a real trade-off:
+
+* A transient failure must never permanently poison a key — otherwise a database
+  blip leaves a caller unable to complete a payment, with no way to tell "already
+  done" from "never happened".
+* But the same key can then produce different outcomes at different times. A
+  caller rejected for insufficient funds who retries after a top-up *will* move
+  money, where a system that persisted the failure would keep returning the
+  original error.
+
+Callers needing "this exact attempt failed, permanently" should mint a new key
+per attempt. Pinned by `a_rejected_transfer_does_not_burn_its_idempotency_key`.
+
+## Postgres 13+ required
+
+`xid8` and `pg_current_xact_id()` do not exist before 13. The failure mode is a
+migration error that does not mention the version, so pin the image in any new
+test or deployment path. CI and the test harness both pin 17.
+
 ## Error handling
 
 Every failure is a named variant of `error::LedgerError` with a stable

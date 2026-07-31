@@ -12,6 +12,10 @@ v0.1.0 — accounts, transfers, and the invariant machinery.
 
 ## Quickstart
 
+**Postgres 13 or later is required** — the schema uses `xid8` and
+`pg_current_xact_id()` to guarantee that a transaction's entries are written in
+the same database transaction that created it. CI and the test harness pin 17.
+
 ```bash
 docker run -d --name ledger-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ledger -p 5432:5432 postgres:17
 ```
@@ -77,6 +81,11 @@ Requires an `Idempotency-Key` header.
 | Sender lacks funds | `422 insufficient_funds` |
 | Account currency ≠ transfer currency | `422 currency_mismatch` |
 | Missing `Idempotency-Key` | `400 missing_idempotency_key` |
+
+A **rejected** transfer releases its key, so the same key may be retried. That
+means a request rejected for insufficient funds and retried after a top-up will
+move money. Mint a new key per attempt if you need "this attempt failed,
+permanently" semantics.
 
 ### `GET /transactions/{id}` → `200`
 
