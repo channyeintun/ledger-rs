@@ -22,7 +22,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # rust-toolchain.toml is the single source of truth for the version and
       # components; `rustup show` installs exactly what it names.
@@ -65,7 +65,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/ledger
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install pinned toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -79,7 +79,7 @@ jobs:
     name: supply chain
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # A ledger's dependency tree is part of its attack surface; a known-
       # vulnerable transitive crate should fail the build, not wait for someone
@@ -92,7 +92,7 @@ jobs:
     name: docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Builds the deployable artifact on every change, so the Dockerfile
       # cannot silently rot while the crate keeps compiling.
