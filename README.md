@@ -250,4 +250,4 @@ and each is a decision rather than an oversight:
 
 ## License
 
-> TODO
+MIT — see [LICENSE](LICENSE).

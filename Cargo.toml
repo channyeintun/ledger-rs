@@ -3,7 +3,9 @@ name = "ledger-rs"
 version = "0.1.0"
 edition = "2024"
 description = "A double-entry ledger service with database-enforced invariants"
+license = "MIT"
 readme = "README.md"
+repository = "https://github.com/channyeintun/ledger-rs"
 keywords = ["ledger", "double-entry", "payments", "accounting", "postgres"]
 categories = ["finance", "web-programming::http-server"]
 # Not published to crates.io: this is a service, not a library.
