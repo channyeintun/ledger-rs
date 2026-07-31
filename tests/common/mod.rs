@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ledger_rs::db;
 use ledger_rs::domain::{Account, TransactionDetail};
@@ -31,72 +32,120 @@ pub const DEFAULT_POOL_SIZE: u32 = 4;
 /// ample contention to expose a lost update or a deadlock.
 pub const CONCURRENT_POOL_SIZE: u32 = 12;
 
+/// Waiting for a connection from the pool. Far longer than production's 10s on
+/// purpose: under a full parallel suite the server is heavily loaded, and a
+/// request that merely *queued* too long would surface as a 500 and read as a
+/// ledger bug. With this generous, any 500 in a test is a genuine defect.
+const TEST_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One Postgres instance per test binary; one database per test.
 static POSTGRES: OnceCell<Arc<PostgresBackend>> = OnceCell::const_new();
 
-enum PostgresBackend {
-    /// `DATABASE_URL` was set — CI, or a developer with a local server.
-    External { admin_url: String },
-    /// Started for us; the container handle must outlive every test.
-    /// Boxed because the container handle dwarfs the other variant.
-    Container {
-        admin_url: String,
-        _container: Box<
+struct PostgresBackend {
+    admin_url: String,
+    /// A database with migrations already applied. Every test database is
+    /// cloned from it with `CREATE DATABASE ... TEMPLATE`, which is a file copy
+    /// inside Postgres rather than a re-run of every DDL statement in the
+    /// migration. With ~20 tests each provisioning a database, running the
+    /// migrations every time dominated the suite and starved the concurrency
+    /// tests badly enough to make them flaky.
+    template: String,
+    /// Held so the container outlives every test; `None` when `DATABASE_URL`
+    /// pointed at a server we did not start.
+    _container: Option<
+        Box<
             testcontainers_modules::testcontainers::ContainerAsync<
                 testcontainers_modules::postgres::Postgres,
             >,
         >,
-    },
-}
-
-impl PostgresBackend {
-    fn admin_url(&self) -> &str {
-        match self {
-            PostgresBackend::External { admin_url } => admin_url,
-            PostgresBackend::Container { admin_url, .. } => admin_url,
-        }
-    }
+    >,
 }
 
 async fn backend() -> Arc<PostgresBackend> {
     POSTGRES
         .get_or_init(|| async {
-            if let Ok(admin_url) = std::env::var("DATABASE_URL") {
-                return Arc::new(PostgresBackend::External { admin_url });
-            }
+            let (admin_url, container) = match std::env::var("DATABASE_URL") {
+                Ok(admin_url) => (admin_url, None),
+                Err(_) => {
+                    use testcontainers_modules::postgres::Postgres;
+                    use testcontainers_modules::testcontainers::ImageExt;
+                    use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-            use testcontainers_modules::postgres::Postgres;
-            use testcontainers_modules::testcontainers::runners::AsyncRunner;
+                    // Pinned to match CI. The default tag for this module is
+                    // older than Postgres 13, which lacks `xid8` /
+                    // `pg_current_xact_id()` — the schema needs both, and the
+                    // failure is a confusing migration error that never
+                    // mentions the version.
+                    //
+                    // `max_connections` gets headroom over the default 100
+                    // because the whole suite runs in parallel against this one
+                    // server.
+                    let container = Postgres::default()
+                        .with_tag("17-alpine")
+                        .with_cmd(["postgres", "-c", "max_connections=300"])
+                        .start()
+                        .await
+                        .expect("failed to start a Postgres container; set DATABASE_URL to use an existing server");
 
-            use testcontainers_modules::testcontainers::ImageExt;
+                    let host = container.get_host().await.expect("container host");
+                    let port = container
+                        .get_host_port_ipv4(5432)
+                        .await
+                        .expect("container port");
 
-            // Pinned to match CI. The default tag for this module is older than
-            // Postgres 13, which lacks `xid8` / `pg_current_xact_id()` — the
-            // schema needs both, and the failure is a confusing migration error
-            // rather than anything that points at the version.
-            //
-            // `max_connections` gets headroom over the default 100 because the
-            // whole suite runs in parallel against this one server.
-            let container = Postgres::default()
-                .with_tag("17-alpine")
-                .with_cmd(["postgres", "-c", "max_connections=300"])
-                .start()
+                    (
+                        format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+                        Some(Box::new(container)),
+                    )
+                }
+            };
+
+            let template = format!("ledger_template_{}", Uuid::new_v4().simple());
+            create_database(&admin_url, &template, None).await;
+
+            // Migrate the template once; every test database inherits it.
+            let template_url = with_database(&admin_url, &template);
+            let pool = db::connect(&template_url, db::PoolConfig::default())
                 .await
-                .expect("failed to start a Postgres container; set DATABASE_URL to use an existing server");
-
-            let host = container.get_host().await.expect("container host");
-            let port = container
-                .get_host_port_ipv4(5432)
+                .expect("connect to the template database");
+            db::run_migrations(&pool)
                 .await
-                .expect("container port");
+                .expect("migrate the template database");
+            // `CREATE DATABASE ... TEMPLATE` refuses to run while anything is
+            // connected to the template, so this close is required, not tidiness.
+            pool.close().await;
 
-            Arc::new(PostgresBackend::Container {
-                admin_url: format!("postgres://postgres:postgres@{host}:{port}/postgres"),
-                _container: Box::new(container),
+            Arc::new(PostgresBackend {
+                admin_url,
+                template,
+                _container: container,
             })
         })
         .await
         .clone()
+}
+
+/// Creates a database, optionally cloning an already-migrated template.
+async fn create_database(admin_url: &str, name: &str, template: Option<&str>) {
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(TEST_ACQUIRE_TIMEOUT)
+        .connect(admin_url)
+        .await
+        .expect("connect to the Postgres admin database");
+
+    // Not a dynamic-SQL risk: both identifiers are UUID-derived names this
+    // harness generated, with no external input in them.
+    let sql = match template {
+        Some(template) => format!(r#"CREATE DATABASE "{name}" TEMPLATE "{template}""#),
+        None => format!(r#"CREATE DATABASE "{name}""#),
+    };
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(&admin)
+        .await
+        .expect("create database");
+
+    admin.close().await;
 }
 
 /// Replaces the database name in a Postgres connection URL.
@@ -133,33 +182,39 @@ impl TestApp {
 
     pub async fn spawn_with_pool_size(pool_size: u32) -> TestApp {
         let backend = backend().await;
-        let admin_url = backend.admin_url();
 
         let database = format!("ledger_test_{}", Uuid::new_v4().simple());
+        create_database(&backend.admin_url, &database, Some(&backend.template)).await;
 
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(admin_url)
-            .await
-            .expect("connect to the Postgres admin database");
-
-        // Not a dynamic-SQL risk: `database` is a UUID-derived identifier this
-        // function just generated, with no external input in it.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            r#"CREATE DATABASE "{database}""#
-        )))
-        .execute(&admin)
+        let url = with_database(&backend.admin_url, &database);
+        let pool = db::connect(
+            &url,
+            db::PoolConfig {
+                max_connections: pool_size,
+                min_connections: 0,
+                acquire_timeout: TEST_ACQUIRE_TIMEOUT,
+                ..db::PoolConfig::default()
+            },
+        )
         .await
-        .expect("create an isolated test database");
-        admin.close().await;
+        .expect("connect to test database");
 
-        let url = with_database(admin_url, &database);
-        let pool = db::connect(&url, pool_size)
-            .await
-            .expect("connect to test database");
-        db::run_migrations(&pool).await.expect("run migrations");
+        // Cloned from the migrated template, so this validates the recorded
+        // migrations rather than applying any.
+        db::run_migrations(&pool).await.expect("verify migrations");
 
-        let app = ledger_rs::http::router(pool.clone());
+        // The full production middleware stack, not just the routes: the
+        // timeout, panic-catching, request-id and body-limit layers are part of
+        // what these tests are asserting about.
+        let config = ledger_rs::config::Config {
+            database_url: url.clone(),
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            pool: ledger_rs::db::PoolConfig::default(),
+            request_timeout: TEST_ACQUIRE_TIMEOUT + Duration::from_secs(30),
+            max_body_bytes: 64 * 1024,
+            shutdown_grace: std::time::Duration::from_secs(5),
+        };
+        let app = ledger_rs::http::app(pool.clone(), &config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind an ephemeral port");

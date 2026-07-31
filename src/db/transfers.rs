@@ -93,16 +93,53 @@ use uuid::Uuid;
 
 use crate::db::{accounts, transactions};
 use crate::domain::{Currency, Direction, TransactionDetail, TransferIntent, TransferOutcome};
-use crate::error::{LedgerError, Result, is_idempotency_key_collision, is_overdraft_violation};
+use crate::error::{
+    LedgerError, Result, is_idempotency_key_collision, is_overdraft_violation,
+    is_retryable_conflict,
+};
 
 pub struct TransferResult {
     pub outcome: TransferOutcome,
     pub detail: TransactionDetail,
 }
 
+/// How many times a transfer aborted by Postgres for a concurrency reason is
+/// re-attempted before the caller is told. Small on purpose: these should be
+/// vanishingly rare given the lock ordering, so a long retry chain would hide
+/// a real problem rather than absorb a transient one.
+const MAX_CONFLICT_RETRIES: usize = 3;
+
 /// Moves `intent.amount` from one account to another, exactly once per
 /// idempotency key.
+///
+/// Retries are safe here precisely *because* of the idempotency key: if an
+/// attempt actually committed before the error surfaced, the retry collides on
+/// the unique index and replays the original instead of moving money twice.
 pub async fn execute(
+    pool: &PgPool,
+    idempotency_key: &str,
+    intent: &TransferIntent,
+) -> Result<TransferResult> {
+    let mut attempt = 0;
+    loop {
+        match execute_once(pool, idempotency_key, intent).await {
+            Err(LedgerError::Database(err))
+                if is_retryable_conflict(&err) && attempt < MAX_CONFLICT_RETRIES =>
+            {
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    error = %err,
+                    idempotency_key,
+                    "transfer aborted by a concurrency conflict; retrying"
+                );
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn execute_once(
     pool: &PgPool,
     idempotency_key: &str,
     intent: &TransferIntent,

@@ -124,6 +124,24 @@ behaviour from the caller.
   Enumerated happy-path assertions do not find the bugs that matter here.
 * Assert `db::check_invariants` returns all-`ok` after any test that writes.
 
+## Operational conventions
+
+* All configuration goes through `config::Config::from_env`, which validates
+  combinations at startup. If you add a knob, add its coherence check there —
+  a timeout that only misbehaves under load is worse than one that refuses to
+  boot.
+* `http::app` builds the full middleware stack; `http::router` is routes only.
+  Tests use `app`, so the timeout, panic-catching, request-id, and body-limit
+  layers are covered rather than assumed. Layer order in `http::app` is
+  load-bearing and commented — read it before reordering.
+* `panic = "unwind"` in the release profile is required. `abort` bypasses
+  `CatchPanicLayer` and leaves an abandoned session holding two account row
+  locks.
+* Every failure a client can cause must be a typed `LedgerError`, never a
+  panic and never a bare 500.
+* Bound every client-supplied field that reaches the ledger. Storage is
+  append-only, so an unbounded field is a permanent commitment.
+
 ## Known v0.1.0 simplifications
 
 Deliberate, documented, and worth revisiting before this is load-bearing:

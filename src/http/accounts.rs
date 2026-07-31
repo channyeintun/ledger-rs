@@ -12,6 +12,9 @@ use crate::domain::{Account, Currency};
 use crate::error::{LedgerError, Result};
 use crate::http::AppState;
 
+/// Matches the `char_length(name) BETWEEN 1 AND 255` check in the schema.
+const MAX_NAME_LEN: usize = 255;
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
@@ -33,6 +36,14 @@ pub async fn create(
     let name = request.name.trim();
     if name.is_empty() {
         return Err(LedgerError::Validation("name must not be empty".into()));
+    }
+    // The database `CHECK` counts characters, so validate the same unit here
+    // rather than bytes — otherwise a name of multi-byte characters passes this
+    // check and is rejected one layer down with a worse message.
+    if name.chars().count() > MAX_NAME_LEN {
+        return Err(LedgerError::Validation(format!(
+            "name must be at most {MAX_NAME_LEN} characters"
+        )));
     }
 
     let account = db::accounts::create(

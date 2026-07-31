@@ -24,14 +24,48 @@ docker run -d --name ledger-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ledg
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/ledger cargo run
 ```
 
-Migrations run automatically at startup.
+Migrations run automatically at startup, under a Postgres advisory lock, so
+running every replica of a rolling deploy is safe.
+
+See [`.env.example`](.env.example) for the full set of variables. The ones worth
+knowing:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | *(required)* | Postgres connection string |
 | `BIND_ADDR` | `0.0.0.0:3000` | Listen address |
 | `DATABASE_MAX_CONNECTIONS` | `16` | Pool size |
-| `RUST_LOG` | `info` | Tracing filter |
+| `DATABASE_LOCK_TIMEOUT_SECS` | `5` | Row-lock wait ceiling |
+| `DATABASE_STATEMENT_TIMEOUT_SECS` | `30` | Statement ceiling; must exceed the lock timeout |
+| `DATABASE_IDLE_IN_TXN_TIMEOUT_SECS` | `30` | Kills sessions holding locks with no progress |
+| `REQUEST_TIMEOUT_SECS` | `30` | Must exceed `DATABASE_ACQUIRE_TIMEOUT_SECS` |
+| `RUST_LOG` | `info,sqlx=warn` | Tracing filter |
+| `LOG_FORMAT` | `text` | `json` for structured logs |
+
+Startup rejects incoherent combinations rather than discovering them under
+load — a request timeout below the connection-acquire timeout, or a statement
+timeout at or below the lock timeout, both fail fast with an explanation.
+
+## Running it
+
+```bash
+docker build -t ledger-rs .
+```
+
+The image is unprivileged (uid 10001) and carries no shell utilities, so point
+your orchestrator's probes at the endpoints rather than at a container-level
+healthcheck:
+
+| Probe | Endpoint | Meaning |
+|---|---|---|
+| liveness | `GET /health/live` | The process is running. Touches nothing else — a database outage must not trigger a restart loop. |
+| readiness | `GET /health/ready` | The process can serve traffic. Checks the pool; returns `503` when it cannot. |
+
+`SIGTERM` drains in-flight requests and then closes the pool, so a transfer in
+flight gets a clean `ROLLBACK` rather than leaving an abandoned session holding
+two account row locks.
+
+Every response carries `x-request-id`, propagated from the caller when supplied.
 
 ## API
 
@@ -151,6 +185,40 @@ The suite covers, beyond the usual:
 - the same idempotency key sent concurrently, creating exactly one transaction
 - property tests over random valid transfer sequences, asserting invariants 1–3
   after every case
+
+## Before this handles real money
+
+The invariants and the concurrency story are production-grade. These are not,
+and each is a decision rather than an oversight:
+
+- **There is no authentication or authorization.** Any caller can open an
+  account, mark it as a funding account, and move money between any two
+  accounts. This is the single largest gap, and it is deliberately left open
+  because the right answer depends on the deployment — mTLS between internal
+  services, an API gateway, or per-tenant keys are all defensible and they lead
+  to different schemas.
+- **Idempotency keys are globally unique**, not scoped to a caller. Two clients
+  that both use `"1"` will collide, and the second gets someone else's
+  transaction back. Scoping the unique index to `(caller_id, idempotency_key)`
+  is the fix, and it needs the auth decision above first.
+- **No rate limiting.** A single client can saturate the pool.
+- **No metrics.** Logs are structured and requests are traced, but there is no
+  `/metrics` endpoint, so there is nothing to alert on.
+- **`ledger_check_invariants()` is not scheduled.** It is exercised by the test
+  suite; in production it should run as a periodic sweep with an alert on any
+  `ok = false`. That sweep is the control that catches drift the constraints
+  cannot.
+- **One `created_at` per record**, standing in for value, booking, and
+  settlement time. Fine while the ledger is closed; not fine once anything
+  external settles into it.
+- **No reversal endpoint.** The schema supports reversals — they are ordinary
+  transactions — but nothing exposes one.
+- **The non-negative `CHECK` assumes a closed ledger.** See
+  [CLAUDE.md](CLAUDE.md#scope-limit-on-the-non-negative-check): if this service
+  ever ingests an external money source, that constraint has to be relaxed to
+  representable-but-monitored, because code that cannot represent a state it is
+  forced into will either abort mid-flow or clamp to zero, and clamping mints
+  money.
 
 ## Design decisions
 

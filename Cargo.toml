@@ -2,6 +2,22 @@
 name = "ledger-rs"
 version = "0.1.0"
 edition = "2024"
+description = "A double-entry ledger service with database-enforced invariants"
+readme = "README.md"
+keywords = ["ledger", "double-entry", "payments", "accounting", "postgres"]
+categories = ["finance", "web-programming::http-server"]
+# Not published to crates.io: this is a service, not a library.
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# Must stay `unwind`. `panic = "abort"` would kill the process on any handler
+# panic, bypassing CatchPanicLayer and turning a single bad request into an
+# outage — and aborting mid-transfer leaves the server to reap an abandoned
+# session that is still holding two account row locks.
+panic = "unwind"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -14,6 +30,8 @@ sha2 = "0.11.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "uuid", "chrono", "rust_decimal", "migrate", "macros"] }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["trace", "timeout", "catch-panic", "limit", "request-id", "sensitive-headers"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.24.0", features = ["v4", "serde"] }

@@ -25,6 +25,20 @@ async fn error_code(response: reqwest::Response) -> String {
         .to_string()
 }
 
+/// Counts responses by status, so a concurrency assertion says *how* the run
+/// went wrong rather than only that a number was off.
+fn tally(statuses: &[StatusCode]) -> String {
+    let mut counts: std::collections::BTreeMap<u16, usize> = std::collections::BTreeMap::new();
+    for status in statuses {
+        *counts.entry(status.as_u16()).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(code, n)| format!("{code}×{n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Opens `amount` of new money into `account` from a funding account.
 async fn fund(app: &TestApp, funding: Uuid, account: Uuid, amount: &str, currency: &str) {
     app.transfer(
@@ -35,6 +49,129 @@ async fn fund(app: &TestApp, funding: Uuid, account: Uuid, amount: &str, currenc
         currency,
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Operational surface
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_endpoints_report_liveness_and_readiness_separately() {
+    let app = TestApp::spawn().await;
+
+    for path in ["/health/live", "/health/ready"] {
+        let response = app
+            .client
+            .get(format!("{}{path}", app.base_url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["status"], "ok", "{path}");
+    }
+}
+
+/// Readiness must fail when the database is gone — otherwise a load balancer
+/// keeps routing payments at a replica that cannot serve them.
+#[tokio::test]
+async fn readiness_fails_when_the_database_is_unreachable() {
+    let app = TestApp::spawn().await;
+
+    app.pool.close().await;
+
+    let response = app
+        .client
+        .get(format!("{}/health/ready", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Liveness still passes: the process is fine, its dependency is not, and
+    // restarting it would not help.
+    let response = app
+        .client
+        .get(format!("{}/health/live", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn every_response_carries_a_request_id_for_correlation() {
+    let app = TestApp::spawn().await;
+
+    let response = app
+        .client
+        .get(format!("{}/health/live", app.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.headers().contains_key("x-request-id"),
+        "responses must carry x-request-id"
+    );
+
+    // A caller-supplied id is propagated rather than replaced, so a trace can
+    // be followed across service boundaries.
+    let response = app
+        .client
+        .get(format!("{}/health/live", app.base_url))
+        .header("x-request-id", "caller-supplied-id")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers().get("x-request-id").unwrap(),
+        "caller-supplied-id"
+    );
+}
+
+/// The ledger is append-only, so an oversized field would be stored forever.
+#[tokio::test]
+async fn oversized_payloads_are_rejected_before_they_reach_the_ledger() {
+    let app = TestApp::spawn().await;
+
+    let funding = app.create_funding_account("funding", "USD").await;
+    let alice = app.create_account("alice", "USD").await;
+    let bob = app.create_account("bob", "USD").await;
+    fund(&app, funding.id, alice.id, "100", "USD").await;
+
+    let response = app
+        .transfer_raw("too-long", alice.id, bob.id, "1", "USD", &"d".repeat(513))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "validation_failed");
+
+    let response = app.create_account_raw(&"n".repeat(256), "USD", false).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A body beyond the configured limit is refused by the middleware, not by
+    // the handler — nothing parses it.
+    let response = app
+        .client
+        .post(format!("{}/transfers", app.base_url))
+        .header("Idempotency-Key", "huge-body")
+        .header("content-type", "application/json")
+        .body("x".repeat(128 * 1024))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_client_error(),
+        "an oversized body must be refused, got {}",
+        response.status()
+    );
+
+    assert_eq!(app.balance(alice.id).await, dec("100"));
+    assert_eq!(
+        app.transaction_count().await,
+        1,
+        "only the funding transfer"
+    );
+    app.assert_invariants_hold().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,8 +700,18 @@ async fn concurrent_oversubscription_never_overdraws() {
         .filter(|s| **s == StatusCode::UNPROCESSABLE_ENTITY)
         .count();
 
-    assert_eq!(created, FUNDED, "exactly the funded amount may go through");
-    assert_eq!(rejected, ATTEMPTS - FUNDED, "the rest must be rejected");
+    assert_eq!(
+        created,
+        FUNDED,
+        "exactly the funded amount may go through; statuses were {}",
+        tally(&results)
+    );
+    assert_eq!(
+        rejected,
+        ATTEMPTS - FUNDED,
+        "every other attempt must be a clean 422, not an internal error; statuses were {}",
+        tally(&results)
+    );
 
     assert_eq!(app.balance(alice.id).await, Decimal::ZERO);
     assert_eq!(app.balance(bob.id).await, dec("100"));

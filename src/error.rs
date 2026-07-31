@@ -137,6 +137,10 @@ pub mod sqlstate {
     pub const CHECK_VIOLATION: &str = "23514";
     pub const RESTRICT_VIOLATION: &str = "23001";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+    /// `serialization_failure`
+    pub const SERIALIZATION_FAILURE: &str = "40001";
+    /// `deadlock_detected`
+    pub const DEADLOCK_DETECTED: &str = "40P01";
 }
 
 /// Inspects a `sqlx` error for a Postgres constraint failure.
@@ -162,6 +166,22 @@ pub fn is_idempotency_key_collision(err: &sqlx::Error) -> bool {
         Some((code, Some(constraint)))
             if code == sqlstate::UNIQUE_VIOLATION
                 && constraint == "transactions_idempotency_key_key"
+    )
+}
+
+/// True when Postgres aborted the transaction for a concurrency reason that a
+/// retry can resolve, rather than for anything wrong with the request.
+///
+/// Transfers take their locks in a globally consistent order, so they cannot
+/// deadlock against *each other*. They can still lose to something outside this
+/// service — a migration, a maintenance script, a backup taking heavier locks —
+/// and the correct response to that is to try again, not to tell the caller
+/// their payment failed.
+pub fn is_retryable_conflict(err: &sqlx::Error) -> bool {
+    matches!(
+        constraint_failure(err),
+        Some((code, _))
+            if code == sqlstate::SERIALIZATION_FAILURE || code == sqlstate::DEADLOCK_DETECTED
     )
 }
 

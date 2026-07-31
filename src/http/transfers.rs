@@ -20,6 +20,12 @@ use crate::http::AppState;
 /// with one request.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 
+/// Upper bound on a transfer description. The ledger is append-only, so
+/// anything accepted here is stored forever and can never be trimmed — an
+/// unbounded field is a permanent, unrecoverable commitment to whatever a
+/// client sent.
+const MAX_DESCRIPTION_LEN: usize = 512;
+
 #[derive(Debug, Deserialize)]
 pub struct TransferRequest {
     pub from_account_id: Uuid,
@@ -46,6 +52,12 @@ pub async fn create(
     // finer than the ledger's precision is told so instead of having it
     // silently rounded on INSERT.
     let amount = Money::new(request.amount, request.currency)?;
+
+    if request.description.chars().count() > MAX_DESCRIPTION_LEN {
+        return Err(LedgerError::Validation(format!(
+            "description must be at most {MAX_DESCRIPTION_LEN} characters"
+        )));
+    }
 
     let intent = TransferIntent {
         from_account_id: request.from_account_id,

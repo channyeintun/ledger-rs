@@ -16,6 +16,7 @@
 //! Floating point is used nowhere for money: `rust_decimal::Decimal` in Rust,
 //! `NUMERIC(20, 8)` in Postgres, JSON strings on the wire.
 
+pub mod config;
 pub mod db;
 pub mod domain;
 pub mod error;

@@ -1,0 +1,7 @@
+# Pinned so a local build, a CI run, and a container image are the same
+# compiler. Single source of truth: CI installs from this file rather than
+# naming a version of its own.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
