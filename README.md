@@ -39,6 +39,7 @@ knowing:
 | `DATABASE_STATEMENT_TIMEOUT_SECS` | `30` | Statement ceiling; must exceed the lock timeout |
 | `DATABASE_IDLE_IN_TXN_TIMEOUT_SECS` | `30` | Kills sessions holding locks with no progress |
 | `REQUEST_TIMEOUT_SECS` | `30` | Must exceed `DATABASE_ACQUIRE_TIMEOUT_SECS` |
+| `ALLOW_FUNDING_ACCOUNT_CREATION` | `false` | Whether `POST /accounts` may open a money-minting funding account |
 | `RUST_LOG` | `info,sqlx=warn` | Tracing filter |
 | `LOG_FORMAT` | `text` | `json` for structured logs |
 
@@ -80,6 +81,13 @@ is parsed as a double by most clients and loses precision in transit.
 
 `allows_negative_balance` marks a funding/equity account and defaults to
 `false`. See [Why funding accounts exist](#why-funding-accounts-exist).
+
+Because a funding account is exempt from the non-negative balance constraint,
+it can create value from nothing — so opening one over HTTP is refused with
+`403 funding_account_creation_disabled` unless the operator sets
+`ALLOW_FUNDING_ACCOUNT_CREATION=true`. Otherwise "may create an account" would
+mean "may mint money", which matters a great deal while there is no
+authentication layer.
 
 ### `GET /accounts/{id}` → `200`
 
@@ -192,11 +200,13 @@ The invariants and the concurrency story are production-grade. These are not,
 and each is a decision rather than an oversight:
 
 - **There is no authentication or authorization.** Any caller can open an
-  account, mark it as a funding account, and move money between any two
-  accounts. This is the single largest gap, and it is deliberately left open
-  because the right answer depends on the deployment — mTLS between internal
-  services, an API gateway, or per-tenant keys are all defensible and they lead
-  to different schemas.
+  account and move money between any two accounts. This is the single largest
+  gap, and it is deliberately left open because the right answer depends on the
+  deployment — mTLS between internal services, an API gateway, or per-tenant
+  keys are all defensible and they lead to different schemas. Note the blast
+  radius is bounded: minting money requires a funding account, and opening one
+  over HTTP is off by default, so an unauthenticated caller can move existing
+  value around but cannot create it.
 - **Idempotency keys are globally unique**, not scoped to a caller. Two clients
   that both use `"1"` will collide, and the second gets someone else's
   transaction back. Scoping the unique index to `(caller_id, idempotency_key)`

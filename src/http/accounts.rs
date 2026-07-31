@@ -33,6 +33,16 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Account>)> {
     let Json(request) = payload.map_err(|err| LedgerError::Validation(err.body_text()))?;
 
+    // `allows_negative_balance` is the single control separating an ordinary
+    // account from one that can mint money: a funding account is exempt from
+    // `accounts_balance_non_negative`, so anything that can open one can create
+    // value from nothing. Taken from the request body unchecked, "may create an
+    // account" would be equivalent to "may create money" — so the decision
+    // belongs to the operator, not the caller.
+    if request.allows_negative_balance && !state.allow_funding_account_creation {
+        return Err(LedgerError::FundingAccountCreationDisabled);
+    }
+
     let name = request.name.trim();
     if name.is_empty() {
         return Err(LedgerError::Validation("name must not be empty".into()));

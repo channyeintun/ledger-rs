@@ -23,6 +23,16 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// How long to let in-flight requests finish after a shutdown signal.
     pub shutdown_grace: Duration,
+    /// Whether `POST /accounts` may open an account exempt from the
+    /// non-negative balance constraint.
+    ///
+    /// Defaults to **false**, because that flag is the one control separating
+    /// an ordinary account from one that can mint money. Left to the caller, it
+    /// makes "can create an account" equivalent to "can create money"; as an
+    /// operator decision, a caller who reaches the endpoint still cannot mint.
+    /// Funding accounts are rare and long-lived, so enabling this briefly at
+    /// provisioning time — or seeding them out of band — costs little.
+    pub allow_funding_account_creation: bool,
 }
 
 impl Config {
@@ -53,6 +63,7 @@ impl Config {
             request_timeout: env_secs("REQUEST_TIMEOUT_SECS", 30)?,
             max_body_bytes: env_parse("MAX_BODY_BYTES", 64 * 1024)?,
             shutdown_grace: env_secs("SHUTDOWN_GRACE_SECS", 20)?,
+            allow_funding_account_creation: env_parse("ALLOW_FUNDING_ACCOUNT_CREATION", false)?,
         };
 
         config.validate()?;
@@ -123,16 +134,32 @@ fn env_secs(key: &str, default_secs: u64) -> anyhow::Result<Duration> {
 /// Replaces the password in a `scheme://user:password@host/...` URL.
 ///
 /// Connection strings reach logs through error messages more often than anyone
-/// intends, and a leaked database password is a leaked ledger.
+/// intends, and a leaked database password is a leaked ledger — one that
+/// bypasses every control in this service, including the append-only triggers.
+///
+/// Two parsing details are load-bearing, and getting either wrong leaks exactly
+/// what this function exists to hide:
+///
+/// * The authority ends at the first `/`, `?` or `#`. Without that bound, an
+///   `@` later in the path would be mistaken for the userinfo delimiter.
+/// * Within the authority, userinfo ends at the **last** `@` (RFC 3986), not
+///   the first. Splitting on the first would treat a password containing a
+///   literal `@` as ending there and print the remainder verbatim.
 fn redact_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
     };
-    let Some((authority, tail)) = rest.split_once('@') else {
+
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+
+    let Some((userinfo, host)) = authority.rsplit_once('@') else {
         return url.to_string();
     };
-    match authority.split_once(':') {
-        Some((user, _password)) => format!("{scheme}://{user}:****@{tail}"),
+
+    match userinfo.split_once(':') {
+        Some((user, _password)) => format!("{scheme}://{user}:****@{host}{tail}"),
+        // Userinfo with no password: nothing to hide.
         None => url.to_string(),
     }
 }
@@ -149,6 +176,7 @@ mod tests {
             request_timeout: Duration::from_secs(30),
             max_body_bytes: 64 * 1024,
             shutdown_grace: Duration::from_secs(20),
+            allow_funding_account_creation: false,
         }
     }
 
@@ -163,7 +191,55 @@ mod tests {
             redact_url("postgres://localhost/ledger"),
             "postgres://localhost/ledger"
         );
+        assert_eq!(
+            redact_url("postgres://ledger@db.internal/ledger"),
+            "postgres://ledger@db.internal/ledger"
+        );
         assert_eq!(redact_url("not a url"), "not a url");
+    }
+
+    /// Regression: userinfo ends at the *last* `@`, not the first. Splitting on
+    /// the first printed the tail of the password verbatim into the startup log.
+    #[test]
+    fn a_password_containing_an_at_sign_is_fully_redacted() {
+        for (url, expected) in [
+            (
+                "postgres://ledger:p@ssw0rd@db.internal:5432/ledger",
+                "postgres://ledger:****@db.internal:5432/ledger",
+            ),
+            (
+                "postgres://ledger:a@b@c@db.internal:5432/ledger",
+                "postgres://ledger:****@db.internal:5432/ledger",
+            ),
+            (
+                "postgres://ledger:p@ss@db.internal/ledger?sslmode=require",
+                "postgres://ledger:****@db.internal/ledger?sslmode=require",
+            ),
+        ] {
+            let redacted = redact_url(url);
+            assert_eq!(redacted, expected, "redacting {url}");
+            for secret in ["p@ssw0rd", "ssw0rd", "a@b@c", "b@c", "p@ss", "ss@"] {
+                assert!(
+                    !redacted.contains(secret),
+                    "{redacted:?} still leaks {secret:?}"
+                );
+            }
+        }
+    }
+
+    /// An `@` after the authority belongs to the path and must not be mistaken
+    /// for the userinfo delimiter.
+    #[test]
+    fn an_at_sign_in_the_path_does_not_confuse_the_parser() {
+        assert_eq!(
+            redact_url("postgres://ledger:secret@db.internal/ledger@shard1"),
+            "postgres://ledger:****@db.internal/ledger@shard1"
+        );
+        // No credentials at all, but an `@` in the path.
+        assert_eq!(
+            redact_url("postgres://db.internal/ledger@shard1"),
+            "postgres://db.internal/ledger@shard1"
+        );
     }
 
     #[test]

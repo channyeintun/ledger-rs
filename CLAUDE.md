@@ -108,6 +108,23 @@ per attempt. Pinned by `a_rejected_transfer_does_not_burn_its_idempotency_key`.
 migration error that does not mention the version, so pin the image in any new
 test or deployment path. CI and the test harness both pin 17.
 
+## Funding accounts are an operator decision
+
+`allows_negative_balance` is the one control separating an ordinary account
+from one that can mint money. `POST /accounts` therefore refuses to set it
+unless `ALLOW_FUNDING_ACCOUNT_CREATION=true`; the default is off, so "may call
+the endpoint" never implies "may create money". Do not relax this to a
+request-body decision, and if you add another way to open an account, gate it
+the same way. Pinned by `funding_accounts_cannot_be_opened_over_http_by_default`.
+
+## Never log a connection string unredacted
+
+`config::redact_url` exists because a leaked database password bypasses every
+control in this service, including the append-only triggers. It parses the
+authority to the first `/`, `?` or `#`, then splits userinfo at the **last**
+`@` — a password containing a literal `@` leaked its tail when this split on
+the first one. Keep the regression tests if you touch it.
+
 ## Error handling
 
 Every failure is a named variant of `error::LedgerError` with a stable

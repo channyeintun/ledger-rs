@@ -27,6 +27,10 @@ use crate::config::Config;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    /// See [`crate::config::Config::allow_funding_account_creation`]. Carried
+    /// in state rather than read from the environment at the call site, so the
+    /// policy is fixed once at startup and cannot drift per request.
+    pub allow_funding_account_creation: bool,
 }
 
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
@@ -44,7 +48,7 @@ pub fn app(pool: PgPool, config: &Config) -> Router {
     //    response rather than a dropped connection.
     // 4. the body limit sits closest to the handler; nothing above it needs to
     //    read the body.
-    router(pool)
+    router(pool, config)
         .layer(RequestBodyLimitLayer::new(config.max_body_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -69,7 +73,7 @@ pub fn app(pool: PgPool, config: &Config) -> Router {
 
 /// Routes only, with no middleware. Useful for tests that want to exercise a
 /// handler without the stack around it.
-pub fn router(pool: PgPool) -> Router {
+pub fn router(pool: PgPool, config: &Config) -> Router {
     Router::new()
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
@@ -77,7 +81,10 @@ pub fn router(pool: PgPool) -> Router {
         .route("/accounts/{id}", get(accounts::get))
         .route("/transfers", post(transfers::create))
         .route("/transactions/{id}", get(transactions::get))
-        .with_state(AppState { pool })
+        .with_state(AppState {
+            pool,
+            allow_funding_account_creation: config.allow_funding_account_creation,
+        })
 }
 
 /// Turns a panic into the same error envelope every other failure uses.

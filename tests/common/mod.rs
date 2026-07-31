@@ -171,16 +171,26 @@ pub struct TestApp {
 
 impl TestApp {
     /// A ledger with a small pool, for tests that are not about concurrency.
+    ///
+    /// Funding-account creation is enabled, because almost every test needs to
+    /// get money into the system. `spawn_locked_down` covers the shipped
+    /// default, where it is not.
     pub async fn spawn() -> TestApp {
-        TestApp::spawn_with_pool_size(DEFAULT_POOL_SIZE).await
+        TestApp::spawn_with(DEFAULT_POOL_SIZE, true).await
     }
 
     /// A ledger sized for parallel load.
     pub async fn spawn_concurrent() -> TestApp {
-        TestApp::spawn_with_pool_size(CONCURRENT_POOL_SIZE).await
+        TestApp::spawn_with(CONCURRENT_POOL_SIZE, true).await
     }
 
-    pub async fn spawn_with_pool_size(pool_size: u32) -> TestApp {
+    /// A ledger in the shipped production posture: funding accounts cannot be
+    /// opened over HTTP.
+    pub async fn spawn_locked_down() -> TestApp {
+        TestApp::spawn_with(DEFAULT_POOL_SIZE, false).await
+    }
+
+    pub async fn spawn_with(pool_size: u32, allow_funding_account_creation: bool) -> TestApp {
         let backend = backend().await;
 
         let database = format!("ledger_test_{}", Uuid::new_v4().simple());
@@ -213,6 +223,7 @@ impl TestApp {
             request_timeout: TEST_ACQUIRE_TIMEOUT + Duration::from_secs(30),
             max_body_bytes: 64 * 1024,
             shutdown_grace: std::time::Duration::from_secs(5),
+            allow_funding_account_creation,
         };
         let app = ledger_rs::http::app(pool.clone(), &config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

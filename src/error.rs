@@ -42,6 +42,12 @@ pub enum LedgerError {
     #[error("transfer amount must be greater than zero")]
     NonPositiveAmount,
 
+    #[error(
+        "opening an account exempt from the non-negative balance constraint is disabled; \
+         it is an operator decision, not a caller's"
+    )]
+    FundingAccountCreationDisabled,
+
     #[error("the Idempotency-Key header is required for this endpoint")]
     MissingIdempotencyKey,
 
@@ -69,6 +75,7 @@ impl LedgerError {
             LedgerError::AccountCurrencyMismatch { .. } => "currency_mismatch",
             LedgerError::SelfTransfer => "self_transfer",
             LedgerError::NonPositiveAmount => "non_positive_amount",
+            LedgerError::FundingAccountCreationDisabled => "funding_account_creation_disabled",
             LedgerError::MissingIdempotencyKey => "missing_idempotency_key",
             LedgerError::IdempotencyKeyConflict { .. } => "idempotency_key_conflict",
             LedgerError::Validation(_) => "validation_failed",
@@ -83,6 +90,8 @@ impl LedgerError {
                 StatusCode::NOT_FOUND
             }
             LedgerError::MissingIdempotencyKey => StatusCode::BAD_REQUEST,
+            // Understood, well-formed, and refused by policy.
+            LedgerError::FundingAccountCreationDisabled => StatusCode::FORBIDDEN,
             LedgerError::IdempotencyKeyConflict { .. } => StatusCode::CONFLICT,
             LedgerError::InsufficientFunds { .. }
             | LedgerError::AccountCurrencyMismatch { .. }

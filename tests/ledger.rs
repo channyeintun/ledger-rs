@@ -216,6 +216,47 @@ async fn unknown_account_is_404_and_unknown_currency_is_422() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// Opening an account exempt from the non-negative balance constraint is the
+/// one thing in this API that creates value from nothing. Left to the request
+/// body, "may create an account" would mean "may mint money" — so by default
+/// the endpoint refuses, and it is an operator decision to allow it.
+#[tokio::test]
+async fn funding_accounts_cannot_be_opened_over_http_by_default() {
+    let app = TestApp::spawn_locked_down().await;
+
+    let response = app.create_account_raw("mint", "USD", true).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        error_code(response).await,
+        "funding_account_creation_disabled"
+    );
+
+    // Ordinary accounts are unaffected.
+    let alice = app.create_account("alice", "USD").await;
+    let bob = app.create_account("bob", "USD").await;
+    assert!(!alice.allows_negative_balance);
+
+    // And with no funding account reachable, money cannot enter the system:
+    // every account is bound by the CHECK constraint.
+    let response = app
+        .transfer_raw(
+            "mint-attempt",
+            alice.id,
+            bob.id,
+            "1000",
+            "USD",
+            "from thin air",
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(error_code(response).await, "insufficient_funds");
+
+    assert_eq!(app.balance(alice.id).await, Decimal::ZERO);
+    assert_eq!(app.balance(bob.id).await, Decimal::ZERO);
+    assert_eq!(app.transaction_count().await, 0);
+    app.assert_invariants_hold().await;
+}
+
 // ---------------------------------------------------------------------------
 // Transfers
 // ---------------------------------------------------------------------------
