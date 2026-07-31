@@ -211,6 +211,10 @@ and each is a decision rather than an oversight:
 - **One `created_at` per record**, standing in for value, booking, and
   settlement time. Fine while the ledger is closed; not fine once anything
   external settles into it.
+- **No erasure path for `accounts.name` or `transactions.description`.** Both
+  are caller-supplied and land in immutable storage, so a right-to-erasure
+  request cannot be honoured today. Crypto-shredding is the fix — see
+  [Why the ledger is immutable](#why-the-ledger-is-immutable).
 - **No reversal endpoint.** The schema supports reversals — they are ordinary
   transactions — but nothing exposes one.
 - **The non-negative `CHECK` assumes a closed ledger.** See
@@ -222,31 +226,167 @@ and each is a decision rather than an oversight:
 
 ## Design decisions
 
-<!--
-  Prose intentionally left to the author. Headings only — fill these in.
--->
-
 ### Why double-entry
 
-> TODO
+The obvious design is one mutable `balance` per account plus a log of what
+happened to it. That works until the two disagree — and when they do, nothing
+in the system can tell you which one is right. You are left reconstructing the
+truth from application logs, if you kept them.
+
+Double-entry removes the possibility. Every movement has two sides that sum to
+zero, so a bug cannot create or destroy value, only misroute it — and
+misrouting is *detectable*, because the total is still zero while the account
+is wrong. That is the actual property worth having: it turns "have we lost
+money?" from an unanswerable question into a query.
+
+The structural payoff is that global integrity follows from a local rule.
+Invariant #1 is per-transaction and cheap, so a trigger can enforce it at
+`COMMIT`; invariant #3 is a statement about the entire system and is a
+*consequence* of #1, not a separate thing to police. Without that, system-wide
+consistency would be a nightly job that tells you about yesterday's corruption.
+
+It also forces you to say where money came from. Single-entry lets you write
+`balance += 100` with no counterparty; double-entry demands the other side
+exist. That is what surfaced `allows_negative_balance` — the model exposed a
+question the original spec had not answered, namely that invariants #2 and #3
+are jointly satisfiable only if *some* account may hold a negative position.
+A model that makes you answer that before you can store anything is doing its
+job.
 
 ### Why the ledger is immutable
 
-> TODO
+Editing a row destroys the evidence needed to answer the only question that
+matters during an incident or an audit: why is this number what it is?
+
+The line is set by reporting, not by purity. Before a number has been shown to
+anyone, correcting it in place is merely untidy. Once a balance has been
+reported to a user, a regulator, or an auditor, rewriting the history behind it
+changes a number someone already acted on — and it does so invisibly. Since a
+ledger cannot know at write time which rows will later be reported, the only
+safe rule is that none of them are editable.
+
+Recording corrections as reversals keeps both the mistake and its remedy in the
+record. A reversal is an ordinary balanced transaction that references the
+original, so nothing about the correction path is special-cased — and the
+history shows what was believed, when, and what replaced it.
+
+This is enforced by database trigger rather than convention because a
+convention is a comment. A trigger still holds for a superuser `psql` session
+during an incident, which is precisely when someone is most tempted to "just
+fix the row". `entries` and `transactions` reject `UPDATE` and `DELETE`
+outright; `accounts` permits only `balance` to change and can never be deleted.
+
+The accepted cost is that there is no erasure path, and it is worth being
+precise about what that implicates. Two fields are caller-supplied and land in
+storage that can never be edited or deleted: `accounts.name` and
+`transactions.description`. In a payments system an account name is very
+plausibly a person's name, so this schema should be assumed to hold personal
+data whether or not that was the intent.
+
+That is a genuine tension with a right-to-erasure request, and immutability
+wins — a ledger that can be rewritten on request is not a ledger. The
+resolution is crypto-shredding rather than deletion: store a reference to an
+encrypted blob, and erase by destroying the key, which leaves the entry log
+intact and every balance still derivable. That is not implemented here, and it
+is the piece to build before this stores anything about an identifiable person.
+Bounding both fields at least keeps the exposure finite and known.
 
 ### Why idempotency is a header, not a body field
 
-> TODO
+The key describes the *delivery attempt*, not the transfer. Two retries of the
+same intent share a key; the intent itself has no opinion about it. Putting it
+in the body mixes those two things, and the request fingerprint would then have
+to exclude one field by hand — exactly the kind of special case that survives
+review once and is forgotten during the next schema change.
+
+Keeping it in a header makes both semantics fall out for free. The fingerprint
+is a hash of the intent alone, so the same intent under a new key is a genuinely
+new transfer, and the same key with a different intent is unambiguously a
+conflict (`409`). Neither case needs a rule of its own.
+
+It also generalises: every future mutating endpoint accepts it identically
+without touching its schema. And `Idempotency-Key` is what Stripe and the IETF
+draft use, so clients, SDKs, and proxies already know the name.
+
+The trade-off is real — a header is easier to drop by accident than a body
+field, since proxies strip them and SDK wrappers forget to forward them. The
+mitigation is to make it **required**: a missing key is a `400`, never a
+silently non-idempotent write. The failure mode of forgetting the key has to be
+a refusal, not a double payment.
 
 ### Concurrency strategy
 
-> TODO — the mechanics are documented in `src/db/transfers.rs`; this section is
-> for the reasoning about why this trade-off over SERIALIZABLE or an
-> event-sourced balance.
+The mechanics are documented at the top of [`src/db/transfers.rs`](src/db/transfers.rs).
+This is why this shape, over the two obvious alternatives.
+
+**Versus `SERIALIZABLE` plus a retry loop.** Correct, and it needs no locking
+discipline at all, which is genuinely attractive. It loses on this workload
+specifically: draining one account with 100 concurrent transfers means every
+transaction conflicts with every other on the same row. Postgres' SSI would
+abort nearly all of them, and the retry loop — not the work — becomes the
+throughput. Pessimistic locking on a known-hot row queues instead of aborting,
+which gives the same guarantee with predictable latency. A bounded retry on
+`40001`/`40P01` is still kept, because this service can lose a deadlock to
+something outside it (a migration, a maintenance script) even though transfers
+cannot deadlock against each other.
+
+**Versus an event-sourced balance** with no `balance` column, locking the
+account row purely as a mutex and recomputing `SUM(entries)` on demand. One
+source of truth, nothing to reconcile. Rejected for two reasons: overdraft
+prevention degrades to an application-level check with no database backstop —
+the database would happily store a negative position — and every balance read
+becomes O(entries). The usual fix is periodic snapshots, which is a
+materialized balance with extra steps and a staleness window.
+
+Two details carry most of the weight. Locks are acquired in **ascending UUID
+order**, as separate statements: sorting gives every transaction in the system
+the same lock sequence, so A→B and B→A queue instead of deadlocking, and
+separate statements keep acquisition order a property of this code rather than
+of whatever row order the query planner happens to pick. And balance updates
+are written `balance = balance + $1`, never `balance = $precomputed` — after
+the lock is granted Postgres re-reads the freshest committed row and re-applies
+the expression, which is what makes `READ COMMITTED` sufficient. The lock and
+the expression form are load-bearing together; writing the precomputed form
+would reintroduce the lost update the lock exists to prevent.
+
+One honest finding, from mutation-testing the suite. With the `CHECK`
+constraint in place, removing `SELECT ... FOR UPDATE` entirely changes nothing
+observable — the constraint plus the atomic update still refuses every
+overdraft. So the row lock is not, strictly, what enforces invariant #2. What
+it does is make the balance check and the debit it authorizes one linearizable
+step, so the correctness argument does not depend on the constraint; make lock
+ordering deadlock-free; and turn an overdraft into a clean `422` rather than a
+transaction abort. That is defense in depth working as intended, but it also
+meant nothing in the suite actually exercised the lock. There is now a test
+that drops the constraint first so the lock is the only defense left — it
+overdraws by ten when the lock is removed.
 
 ### Why `accounts.balance` is materialized
 
-> TODO
+Caching a balance is the thing every guide tells you not to do in a ledger.
+It earns its place here for two reasons, and only under a specific condition.
+
+First, it makes invariant #2 a `CHECK` constraint. A negative balance becomes
+*unrepresentable* rather than merely rejected by code — no future caller, no
+migration script, no manual session can produce one. A balance derived from a
+`SUM` cannot be expressed as a constraint at all, so the alternative is
+application-level enforcement with nothing underneath it. Second, reads are
+O(1). An account that has transacted for a year should not cost more to read
+than one opened this morning.
+
+The cost is drift, and that is only acceptable because of two things. Every
+write to the column happens in the same database transaction as the entries
+that justify it, through exactly one code path. And
+`ledger_check_invariants()` re-derives every balance from the entry log and
+compares — it is the control that makes the cache safe rather than merely
+convenient, and it is asserted after every test that writes and after every
+property-test case. In production it belongs on a schedule with an alert on any
+`ok = false`; that it is not yet scheduled is listed under
+[Before this handles real money](#before-this-handles-real-money).
+
+The rule for anything built on top of this: the entry log is the record and the
+column is an optimization that must always be provable from it. Code that
+writes one without the other is a bug, however convenient it looks.
 
 ## License
 
